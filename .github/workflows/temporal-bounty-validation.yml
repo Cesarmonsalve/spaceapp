@@ -1,0 +1,41 @@
+name: Temporal bounty draft validation
+
+on:
+  push:
+    branches: [bounty/temporal-sandbox-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporal-bounty-draft-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build -w @space/contracts
+      - name: Record genuine synthetic histories and exercise sandbox cases
+        run: /usr/bin/time -f 'sandbox_record_seconds=%e' npm run temporal:record-histories -w @space/worker
+      - name: Replay all histories and prove that an incompatible timer fails
+        run: /usr/bin/time -f 'replay_seconds=%e' npm test -w @space/worker -- temporal-replay
+      - name: Preserve synthetic histories for local replay
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-workflow-histories
+          path: apps/worker/tests/fixtures/workflow-histories/*.json
+          if-no-files-found: ignore
+          retention-days: 1
