@@ -38,10 +38,16 @@ describe("turns and Dot goals in the real Temporal sandbox", () => {
   }, 120_000);
 
   beforeEach(() => {
-    for (const activity of Object.values(activities)) activity.mockClear();
-    activities.dotGoalStep.mockReset().mockResolvedValue({ state: "DONE", runId: null, goalStatus: "COMPLETE" });
-    activities.dotGoalObserve.mockReset().mockResolvedValue({ run: "COMPLETED", goalStatus: "ACTIVE" });
-    activities.runRoomAgentBackgroundAction.mockReset().mockResolvedValue({ status: "COMPLETED" });
+    for (const activity of Object.values(activities)) activity.mockReset();
+    activities.recordDummyTurnStarted.mockResolvedValue(undefined);
+    activities.recordDummyTurnCompleted.mockResolvedValue({ message: "synthetic turn", status: "COMPLETED" });
+    activities.runCodexAppServerTurn.mockResolvedValue({ status: "COMPLETED", message: "codex synthetic result" });
+    activities.runOpenCodeAgentTurn.mockResolvedValue({ status: "COMPLETED", message: "opencode synthetic result" });
+    activities.runCliAgentTurn.mockResolvedValue({ status: "COMPLETED", message: "cli synthetic result" });
+    activities.runRoomAgentBackgroundAction.mockResolvedValue({ status: "COMPLETED" });
+    activities.failRoomAgentBackgroundAction.mockResolvedValue(undefined);
+    activities.dotGoalStep.mockResolvedValue({ state: "DONE", runId: null, goalStatus: "COMPLETE" });
+    activities.dotGoalObserve.mockResolvedValue({ run: "COMPLETED", goalStatus: "ACTIVE" });
   });
 
   afterEach(async () => {
@@ -49,9 +55,12 @@ describe("turns and Dot goals in the real Temporal sandbox", () => {
   });
 
   afterAll(async () => {
-    if (worker) worker.shutdown();
-    if (running) await running;
-    if (env) await env.teardown();
+    try {
+      if (worker) worker.shutdown();
+      if (running) await running;
+    } finally {
+      if (env) await env.teardown();
+    }
   }, 30_000);
 
   async function start(workflowType: string, input: unknown, workflowId = `${workflowType}-${randomUUID()}`) {
@@ -71,6 +80,25 @@ describe("turns and Dot goals in the real Temporal sandbox", () => {
     expect(activities.recordDummyTurnCompleted).toHaveBeenCalledWith(input);
     expect(activities.recordDummyTurnStarted.mock.invocationCallOrder.at(-1)).toBeLessThan(activities.recordDummyTurnCompleted.mock.invocationCallOrder[0]);
     await recordWorkflowHistory(handle, "dummy-turn-retry");
+  }, 30_000);
+
+  it("retries a transient Codex activity failure through the production turn workflow", async () => {
+    activities.runCodexAppServerTurn.mockRejectedValueOnce(new Error("transient Codex transport failure"));
+    const input = dummyTurnInputSchema.parse({
+      roomId: "room:turn", paneId: "pane:turn", prompt: "synthetic", traceId: "trace:codex-retry", providerId: "codex"
+    });
+    const handle = await start("codexAppServerTurnWorkflow", input);
+    await expect(handle.result()).resolves.toEqual({ status: "COMPLETED", message: "codex synthetic result" });
+    expect(activities.runCodexAppServerTurn).toHaveBeenCalledTimes(2);
+    expect(activities.runCodexAppServerTurn).toHaveBeenNthCalledWith(1, input);
+    expect(activities.runCodexAppServerTurn).toHaveBeenNthCalledWith(2, input);
+    expect(activities.runOpenCodeAgentTurn).not.toHaveBeenCalled();
+    expect(activities.runCliAgentTurn).not.toHaveBeenCalled();
+    const history = await handle.fetchHistory();
+    const scheduled = history.events?.find(event => event.activityTaskScheduledEventAttributes)?.activityTaskScheduledEventAttributes;
+    expect(scheduled?.activityType?.name).toBe("runCodexAppServerTurn");
+    expect(scheduled?.retryPolicy?.maximumAttempts).toBe(5);
+    await recordWorkflowHistory(handle, "codex-app-server-turn-retry");
   }, 30_000);
 
   it.each([
