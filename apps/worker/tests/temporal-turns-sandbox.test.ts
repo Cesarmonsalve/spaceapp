@@ -117,7 +117,15 @@ describe("turns and Dot goals in the real Temporal sandbox", () => {
     const history = await handle.fetchHistory();
     const scheduled = history.events?.find(event => event.activityTaskScheduledEventAttributes)?.activityTaskScheduledEventAttributes;
     expect(scheduled?.activityType?.name).toBe(activityName);
-    expect(Number(scheduled?.startToCloseTimeout?.seconds)).toBe(timeoutSeconds);
+    const started = history.events?.find(event => event.workflowExecutionStartedEventAttributes)?.workflowExecutionStartedEventAttributes;
+    const runTimeoutSeconds = Number(started?.workflowRunTimeout?.seconds);
+    expect(runTimeoutSeconds).toBeGreaterThan(0);
+    // The Java test server caps its default workflow run at ten years, then
+    // clamps activity timeouts to that run timeout. Native Chat requests 100
+    // years; verify the persisted server contract rather than assuming it keeps
+    // the requested value unchanged. See validateScheduleActivityTask:
+    // https://github.com/temporalio/sdk-java/blob/master/temporal-test-server/src/main/java/io/temporal/internal/testservice/TestWorkflowMutableStateImpl.java
+    expect(Number(scheduled?.startToCloseTimeout?.seconds)).toBe(Math.min(timeoutSeconds, runTimeoutSeconds));
     if (providerId === "opencode") await recordWorkflowHistory(handle, "codex-app-server-turn");
   }, 30_000);
 

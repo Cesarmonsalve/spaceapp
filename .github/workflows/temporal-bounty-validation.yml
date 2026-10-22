@@ -27,15 +27,49 @@ jobs:
           node-version-file: .nvmrc
       - run: npm ci --no-audit --no-fund
       - run: npm run build -w @space/contracts
-      - name: Record genuine synthetic histories and exercise sandbox cases
-        run: /usr/bin/time -f 'sandbox_record_seconds=%e' npm run temporal:record-histories -w @space/worker
-      - name: Replay all histories and prove that an incompatible timer fails
-        run: /usr/bin/time -f 'replay_seconds=%e' npm test -w @space/worker -- temporal-replay
-      - name: Preserve synthetic histories for local replay
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - run: npm run build -w @space/memory-graph
+      - name: Exercise every new sandbox and replay case within three minutes
+        run: >-
+          /usr/bin/time -f 'temporal_added_seconds=%e'
+          timeout --signal=TERM --kill-after=15s 180s
+          npm test -w @space/worker --
+          tests/temporal-turns-sandbox.test.ts
+          tests/temporal-supervisor-sandbox.test.ts
+          tests/temporal-memory-sandbox.test.ts
+          tests/temporal-legacy-supervisor-sandbox.test.ts
+          tests/temporal-replay.test.ts
+
+  public-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          name: synthetic-workflow-histories
-          path: apps/worker/tests/fixtures/workflow-histories/*.json
-          if-no-files-found: ignore
-          retention-days: 1
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: .nvmrc
+      # This draft-only job mirrors the public CI gates after provenance.
+      # The sponsor documents the external-PR provenance exception in #60/#66.
+      # The actual upstream provenance workflow is not changed or bypassed.
+      - name: Create sanitized candidate
+        run: node scripts/public-export.mjs --output "$RUNNER_TEMP/spaceapp-public-export"
+      - name: Install candidate dependencies
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm ci --no-audit --no-fund
+      - name: Install public suite tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep ffmpeg
+      - name: Public release tests including Temporal sandbox and replay
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run test:public
+      - name: Typecheck candidate
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run check
+      - name: Build candidate
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run build
+      - name: Pack launcher candidate
+        working-directory: ${{ runner.temp }}/spaceapp-public-export
+        run: npm run pack:dry-run -w run-spaceapp

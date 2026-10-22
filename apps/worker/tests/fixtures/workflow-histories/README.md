@@ -4,6 +4,10 @@ These fixtures must be recorded from the real time-skipping test server with
 stub activities. They contain no database, provider account or user session data.
 Recording removes host identities and diagnostic stack paths; event IDs,
 commands, payloads and ordering remain server-generated. Never invent events.
+Each JSON document stores the original synthetic workflow ID and a generated
+protobuf JSON representation of its history. Recording verifies a lossless
+protobuf byte round-trip before removing diagnostic identities and stack paths.
+Replay restores the generated History message and uses the original workflow ID.
 
 The ordinary worker tests replay every committed JSON file against the current
 production workflow implementations. They also replay the dummy-turn history

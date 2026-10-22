@@ -3,21 +3,25 @@ import { fileURLToPath } from "node:url";
 import { Context } from "@temporalio/activity";
 import { ApplicationFailure, TimeoutFailure, TimeoutType, defaultPayloadConverter } from "@temporalio/common";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
-import { Worker } from "@temporalio/worker";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { WorkflowContinuedAsNewError } from "@temporalio/client";
+import { bundleWorkflowCode, Worker } from "@temporalio/worker";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ROOM_AGENT_ENQUEUE_SIGNAL, ROOM_AGENT_STOP_SIGNAL,
   roomAgentSupervisorInputSchema, roomAgentSupervisorQueueItemSchema,
   type RoomAgentSupervisorQueueItem
 } from "@space/contracts";
 import { recordWorkflowHistory } from "./support/record-workflow-history.js";
+import { continuationFixture } from "./room-continuation-fixture.js";
+import { discardSupervisorTurn, finishSupervisorTurn, prepareBackgroundContinuation, supervisorTurnState } from "../src/room-background-continuation.js";
 
 // Only activities are replaced. The supervisor and its child execute from the
 // production entry point inside Temporal's workflow isolate.
-describe("room supervisor in the Temporal sandbox", () => {
+describe("room supervisor in the Temporal sandbox", { timeout: 30_000 }, () => {
   let env: TestWorkflowEnvironment;
   let worker: Worker;
   let running: Promise<void>;
+  let workflowBundle: Awaited<ReturnType<typeof bundleWorkflowCode>>;
   let sequence = 0;
   const taskQueue = `supervisor-sandbox-${randomUUID()}`;
   const handles: Array<ReturnType<TestWorkflowEnvironment["client"]["workflow"]["getHandle"]>> = [];
@@ -29,10 +33,26 @@ describe("room supervisor in the Temporal sandbox", () => {
   let turn: ReturnType<typeof vi.fn>;
 
   beforeAll(async () => {
+    workflowBundle = await bundleWorkflowCode({
+      workflowsPath: fileURLToPath(new URL("../src/workflows.ts", import.meta.url))
+    });
+  }, 120_000);
+
+  beforeEach(async () => {
+    env = undefined!;
+    worker = undefined!;
+    running = undefined!;
+    check = vi.fn(async () => "READY");
+    prepare = vi.fn(async () => ({ state: "WAITING" }));
+    discard = vi.fn(async () => undefined);
+    finish = vi.fn(async () => undefined);
+    turn = vi.fn(async () => verified());
+    // Time skipping is global to a server. A fresh environment also isolates
+    // locks held by activities that were outstanding when a prior run ended.
     env = await TestWorkflowEnvironment.createTimeSkipping();
     worker = await Worker.create({
       connection: env.nativeConnection, taskQueue,
-      workflowsPath: fileURLToPath(new URL("../src/workflows.ts", import.meta.url)),
+      workflowBundle,
       activities: {
         checkRoomAgentSupervisorTurn: (...args: unknown[]) => check(...args),
         prepareRoomAgentBackgroundContinuation: (...args: unknown[]) => prepare(...args),
@@ -47,25 +67,17 @@ describe("room supervisor in the Temporal sandbox", () => {
     void running.catch(() => undefined);
   }, 120_000);
 
-  beforeEach(() => {
-    check = vi.fn(async () => "READY");
-    prepare = vi.fn(async () => ({ state: "WAITING" }));
-    discard = vi.fn(async () => undefined);
-    finish = vi.fn(async () => undefined);
-    turn = vi.fn(async () => verified());
-  });
-
   afterEach(async () => {
-    for (const release of releases.splice(0)) release();
-    for (const handle of handles.splice(0)) {
-      await handle.terminate("Sandbox test complete").catch(() => undefined);
+    try {
+      for (const release of releases.splice(0)) release();
+      for (const handle of handles.splice(0)) {
+        await handle.terminate("Sandbox test complete").catch(() => undefined);
+      }
+      if (worker) worker.shutdown();
+      if (running) await running;
+    } finally {
+      if (env) await env.teardown();
     }
-  });
-
-  afterAll(async () => {
-    if (worker) worker.shutdown();
-    if (running) await running;
-    if (env) await env.teardown();
   }, 30_000);
 
   function item(suffix: string, missionId = "mission:sandbox", automatic = false): RoomAgentSupervisorQueueItem {
@@ -81,6 +93,32 @@ describe("room supervisor in the Temporal sandbox", () => {
       status: "VERIFIED", executedActionCount: 1, statusReason: "Verified remaining request.",
       ...(pendingActionIds ? { pendingActionIds } : {})
     } };
+  }
+
+  function storeDriver() {
+    const c = continuationFixture();
+    const prepared: RoomAgentSupervisorQueueItem[] = [];
+    prepare = vi.fn(async input => {
+      const result = await prepareBackgroundContinuation(input, c.store);
+      if (result.state === "READY") prepared.push(result.item);
+      return result;
+    });
+    check = vi.fn(input => supervisorTurnState(input, c.store));
+    discard = vi.fn(({ item, reason, errorCode }) => discardSupervisorTurn(item, reason, c.store, errorCode));
+    finish = vi.fn(input => finishSupervisorTurn(input, c.store));
+    turn = vi.fn(async input => {
+      c.store.updateSpaceAgentRun(input.agentRunId, { status: "COMPLETED" });
+      return verified();
+    });
+    const workflowInput = roomAgentSupervisorInputSchema.parse({ roomId: c.room.id, monitoringMissionIds: [c.initial.mission.id] });
+    return { ...c, prepared, workflowInput };
+  }
+
+  async function startStoreDriver(c: ReturnType<typeof storeDriver>, extra: Record<string, unknown> = {}) {
+    const handle = await start({ ...c.workflowInput, ...extra });
+    await waitForTimer(handle);
+    await env.sleep("1 second");
+    return handle;
   }
 
   async function start(input: Record<string, unknown> = {}) {
@@ -152,41 +190,56 @@ describe("room supervisor in the Temporal sandbox", () => {
   });
 
   it("polls background work after one second and executes allocation, send, verification in one mission", async () => {
-    const send = item("send", "mission:sandbox", true);
-    const verify = item("verify", "mission:sandbox", true);
-    prepare.mockResolvedValueOnce({ state: "READY", item: send }).mockResolvedValueOnce({ state: "READY", item: verify });
-    turn.mockResolvedValueOnce(verified(["action:send"]));
-    const handle = await start({ monitoringMissionIds: [send.missionId] });
-    await waitForTimer(handle);
-    await env.sleep("1 second");
+    const c = storeDriver();
+    turn.mockImplementationOnce(async input => {
+      expect(input.prompt).toContain("Open CLI and Chat, then send a story");
+      c.store.createRoomAgentAction({ ...c.action, actionId: "action:send", idempotencyKey: "send-once", actionType: "SEND",
+        evidence: { cli: "Story complete", chat: "Story complete" }, statusReason: "Both tasks completed." });
+      c.store.updateSpaceAgentRun(input.agentRunId, { status: "COMPLETED" });
+      return verified(["action:send"]);
+    });
+    const handle = await startStoreDriver(c);
     await settled(() => expect(turn).toHaveBeenCalledOnce());
     await waitForTimer(handle, 2);
     await env.sleep("1 second");
     await settled(() => expect(finish).toHaveBeenCalledOnce());
-    expect(turn.mock.calls.map(([input]) => input.agentRunId)).toEqual([send.turn.agentRunId, verify.turn.agentRunId]);
-    expect(finish).toHaveBeenCalledWith(expect.objectContaining({ item: verify, status: "COMPLETED" }));
+    await settled(() => expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("COMPLETED"));
+    expect(turn.mock.calls.map(([input]) => input.agentRunId)).toEqual(c.prepared.map(item => item.turn.agentRunId));
+    expect(c.store.listRoomAgentActions(c.initial.mission.id).filter(action => action.actionType === "SEND")).toHaveLength(1);
+    expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("COMPLETED");
+    expect(finish).toHaveBeenCalledWith(expect.objectContaining({ item: c.prepared[1], status: "COMPLETED" }));
     const history = await handle.fetchHistory();
     expect(history.events?.filter(event => event.childWorkflowExecutionStartedEventAttributes)).toHaveLength(2);
   });
 
   it.each(["stop", "follow-up"])("retires a prepared continuation when %s arrives before the activity reply", async kind => {
-    const automatic = item("prepared", "mission:sandbox", true);
+    const c = storeDriver();
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     releases.push(() => release());
-    prepare.mockImplementationOnce(async () => { await gate; return { state: "READY", item: automatic }; });
-    const handle = await start({ monitoringMissionIds: [automatic.missionId] });
-    await waitForTimer(handle);
-    await env.sleep("1 second");
-    await settled(() => expect(prepare).toHaveBeenCalledOnce());
-    if (kind === "stop") await handle.signal(ROOM_AGENT_STOP_SIGNAL, { missionId: null, reason: "Stop" });
-    else await handle.signal(ROOM_AGENT_ENQUEUE_SIGNAL, item("follow-up"));
+    prepare.mockImplementationOnce(async input => {
+      const result = await prepareBackgroundContinuation(input, c.store);
+      if (result.state === "READY") c.prepared.push(result.item);
+      await gate;
+      return result;
+    });
+    const handle = await startStoreDriver(c);
+    await settled(() => expect(c.prepared).toHaveLength(1));
+    const automatic = c.prepared[0]!;
+    if (kind === "stop") {
+      c.store.updateRoomAgentMission(c.initial.mission.id, { status: "INTERRUPTED" });
+      await handle.signal(ROOM_AGENT_STOP_SIGNAL, { missionId: null, reason: "Stop" });
+    } else {
+      const followUp = c.enqueue("follow-up", "Only inspect the room.");
+      await handle.signal(ROOM_AGENT_ENQUEUE_SIGNAL, followUp.queueItem);
+    }
     release();
     await settled(() => expect(discard).toHaveBeenCalledWith(expect.objectContaining({ item: automatic })));
+    await settled(() => expect(c.store.getRoomAgentTurn(c.initial.mission.id, automatic.turn.agentRunId)?.run.status).toBe("INTERRUPTED"));
     if (kind === "stop") expect(turn).not.toHaveBeenCalled();
     else {
       await settled(() => expect(turn).toHaveBeenCalledOnce());
-      expect(turn.mock.calls[0]![0].agentRunId).not.toBe(automatic.turn.agentRunId);
+      expect(turn.mock.calls[0]![0].roomAgentOperatorRequest).toBe("Only inspect the room.");
     }
   });
 
@@ -231,23 +284,28 @@ describe("room supervisor in the Temporal sandbox", () => {
     ["plain failure", "Error", "ROOM_AGENT_SUPERVISOR_FAILED"],
     ["application failure", "CODEX_APP_SERVER_TURN_TIMEOUT", "CODEX_APP_SERVER_TURN_TIMEOUT"]
   ])("finishes a child %s as FAILED with its cause code", async (_label, type, code) => {
+    const c = storeDriver();
     turn.mockImplementation(async () => { throw ApplicationFailure.nonRetryable("Child failed", type); });
-    const queued = item("failure");
-    await start({ pending: [queued] });
+    await startStoreDriver(c);
     await settled(() => expect(finish).toHaveBeenCalledOnce());
+    const queued = c.prepared[0]!;
     expect(finish).toHaveBeenCalledWith(expect.objectContaining({ item: queued, status: "FAILED", errorCode: code }));
     expect(discard).toHaveBeenCalledWith(expect.objectContaining({ item: queued, errorCode: code }));
+    await settled(() => expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("FAILED"));
+    expect(c.store.getRoomAgentTurn(c.initial.mission.id, queued.turn.agentRunId)?.run).toMatchObject({ status: "FAILED", errorCode: code });
   });
 
   it("preserves a serialized Temporal timeout cause through the real activity and child failure chain", async () => {
+    const c = storeDriver();
     turn.mockImplementation(async () => {
       throw ApplicationFailure.create({ message: "Transport failed", type: "Error", nonRetryable: true,
         cause: new TimeoutFailure("Turn timed out", undefined, TimeoutType.START_TO_CLOSE) });
     });
-    const queued = item("timeout");
-    await start({ pending: [queued] });
+    await startStoreDriver(c);
     await settled(() => expect(finish).toHaveBeenCalledOnce());
     expect(finish).toHaveBeenCalledWith(expect.objectContaining({ status: "FAILED", errorCode: "ROOM_AGENT_SUPERVISOR_TIMEOUT" }));
+    await settled(() => expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("FAILED"));
+    expect(c.store.getRoomAgentTurn(c.initial.mission.id, c.prepared[0]!.turn.agentRunId)?.run).toMatchObject({ status: "FAILED", errorCode: "ROOM_AGENT_SUPERVISOR_TIMEOUT" });
   });
 
   it("continues after 50 processed turns carrying pending, interrupted and monitored state", async () => {
@@ -264,27 +322,35 @@ describe("room supervisor in the Temporal sandbox", () => {
   });
 
   it("carries a prepared continuation at the 50-turn boundary and starts it once in the next run", async () => {
-    const automatic = item("boundary", "mission:sandbox", true);
-    prepare.mockResolvedValueOnce({ state: "READY", item: automatic });
-    const handle = await start({ processedCount: 50, monitoringMissionIds: [automatic.missionId] });
-    await waitForTimer(handle);
-    await env.sleep("1 second");
+    const c = storeDriver();
+    const handle = await startStoreDriver(c, { processedCount: 50 });
     const carried = await continued(handle);
+    const automatic = c.prepared[0]!;
     expect(carried.pending).toEqual([automatic]);
+    const firstRun = env.client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId);
+    const history = await firstRun.fetchHistory();
+    expect(history.events?.filter(event => event.childWorkflowExecutionStartedEventAttributes)).toHaveLength(0);
     await settled(() => expect(turn).toHaveBeenCalledOnce());
     expect(turn.mock.calls[0]![0].agentRunId).toBe(automatic.turn.agentRunId);
+    await settled(() => expect(c.store.getRoomAgentMission(c.room.id, c.initial.mission.id)?.status).toBe("COMPLETED"));
   });
 
   it("continues after 250 one-second monitoring polls retaining the mission", async () => {
     const handle = await start({ monitoringMissionIds: ["mission:monitor"] });
-    await waitForTimer(handle);
-    await env.sleep("250 seconds");
+    // result() enables SDK-managed time skipping for the complete first run;
+    // followRuns:false stops at continue-as-new instead of waiting forever on
+    // this long-lived supervisor's next run.
+    await expect(env.client.workflow.result(handle.workflowId, handle.firstExecutionRunId, { followRuns: false })).rejects.toBeInstanceOf(WorkflowContinuedAsNewError);
     const carried = await continued(handle);
     expect(carried).toEqual(roomAgentSupervisorInputSchema.parse({ roomId: "room:sandbox", monitoringMissionIds: ["mission:monitor"] }));
-    // The resumed run has its own timer and does not poll before its first second.
-    expect(prepare).toHaveBeenCalledTimes(250);
     const history = await env.client.workflow.getHandle(handle.workflowId, handle.firstExecutionRunId).fetchHistory();
-    expect(history.events?.filter(event => event.timerStartedEventAttributes)).toHaveLength(250);
+    const timers = history.events?.filter(event => event.timerStartedEventAttributes) ?? [];
+    expect(timers).toHaveLength(250);
+    expect(timers.every(event => Number(event.timerStartedEventAttributes!.startToFireTimeout!.seconds) === 1)).toBe(true);
+    expect(history.events?.filter(event => event.activityTaskScheduledEventAttributes?.activityType?.name === "prepareRoomAgentBackgroundContinuation")).toHaveLength(250);
+    // The resumed run may already poll before the result waiter reacquires the
+    // server's time-skipping lock; exact counts belong to the pinned history.
+    expect(prepare.mock.calls.length).toBeGreaterThanOrEqual(250);
   }, 60_000);
 
   it("defers continue-as-new while more than 100 queued turns would exceed input bounds", async () => {

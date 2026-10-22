@@ -43,52 +43,55 @@ function completedRun() {
 
 describe("memory workflows in the real Temporal sandbox", () => {
   let env: TestWorkflowEnvironment;
-  let workers: Worker[] = [];
-  let running: Promise<void>[] = [];
+  const workers: Worker[] = [];
+  const running: Promise<void>[] = [];
   let run = completedRun();
-  const refresh = vi.fn(async (_input: MemoryMaintenanceInput) => snapshot);
-  const allMonths = vi.fn(async (_input: MemoryMaintenanceInput) => snapshot);
+  const refresh = vi.fn<(input: MemoryMaintenanceInput) => Promise<typeof snapshot>>(async () => snapshot);
+  const allMonths = vi.fn<(input: MemoryMaintenanceInput) => Promise<typeof snapshot>>(async () => snapshot);
   const sessions = vi.fn(async () => 0);
-  const audit = vi.fn(async (_input: ScheduledMemoryAuditInput) => run);
+  const audit = vi.fn<(input: ScheduledMemoryAuditInput) => Promise<typeof run>>(async () => run);
   const prepare = vi.fn(async (): Promise<MemoryConsolidationPreparation> => ({ run, changeSetId: null }));
   const mutate = vi.fn(async () => mutation);
-  const finalize = vi.fn(async (_input: FinalizeMemoryRepairInput) => run);
+  const finalize = vi.fn<(input: FinalizeMemoryRepairInput) => Promise<typeof run>>(async () => run);
 
   beforeAll(async () => {
     env = await TestWorkflowEnvironment.createTimeSkipping();
-    try {
-      workers = [await Worker.create({
-        connection: env.nativeConnection,
-        taskQueue: MEMORY_MAINTENANCE_TASK_QUEUE,
-        workflowsPath: fileURLToPath(new URL("../src/memory-maintenance-workflows.ts", import.meta.url)),
-        activities: {
-          refreshMemoryGraphSnapshot: refresh,
-          refreshAllMonthsMemoryGraphSnapshot: allMonths,
-          reconcileStaleSpaceAgentSessions: sessions,
-          createScheduledMemoryAudit: audit,
-          prepareMemoryConsolidation: prepare,
-          finalizeMemoryRepair: finalize
-        }
-      })];
-      workers.push(await Worker.create({
-        connection: env.nativeConnection,
-        taskQueue: MEMORY_MUTATION_TASK_QUEUE,
-        workflowsPath: fileURLToPath(new URL("../src/memory-mutation-workflows.ts", import.meta.url)),
-        activities: { executePersistedMemoryChangeSet: mutate }
-      }));
-      running = workers.map((worker) => worker.run());
-      // Preserve failures for afterAll while avoiding an unhandled rejection.
-      for (const promise of running) void promise.catch(() => {});
-    } catch (error) {
-      await env.teardown();
-      throw error;
-    }
+    const startWorker = (worker: Worker) => {
+      workers.push(worker);
+      const promise = worker.run();
+      running.push(promise);
+      // Keep a startup failure observable in afterAll without an unhandled rejection.
+      void promise.catch(() => {});
+    };
+    startWorker(await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: MEMORY_MAINTENANCE_TASK_QUEUE,
+      workflowsPath: fileURLToPath(new URL("../src/memory-maintenance-workflows.ts", import.meta.url)),
+      activities: {
+        refreshMemoryGraphSnapshot: refresh,
+        refreshAllMonthsMemoryGraphSnapshot: allMonths,
+        reconcileStaleSpaceAgentSessions: sessions,
+        createScheduledMemoryAudit: audit,
+        prepareMemoryConsolidation: prepare,
+        finalizeMemoryRepair: finalize
+      }
+    }));
+    startWorker(await Worker.create({
+      connection: env.nativeConnection,
+      taskQueue: MEMORY_MUTATION_TASK_QUEUE,
+      workflowsPath: fileURLToPath(new URL("../src/memory-mutation-workflows.ts", import.meta.url)),
+      activities: { executePersistedMemoryChangeSet: mutate }
+    }));
+    // afterAll owns teardown even if creating the second worker fails: the
+    // first worker is already running and can release its native connection.
   }, 120_000);
 
   afterAll(async () => {
     try {
       for (const worker of workers) if (worker.getState() === "RUNNING") worker.shutdown();
-      await Promise.all(running);
+      const results = await Promise.allSettled(running);
+      const failure = results.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
     } finally {
       await env?.teardown();
     }
