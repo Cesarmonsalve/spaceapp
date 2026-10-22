@@ -139,13 +139,13 @@ describe("turns and Dot goals in the real Temporal sandbox", () => {
 
   it("records the patched background failure path after all five attempts", async () => {
     activities.runRoomAgentBackgroundAction.mockRejectedValue(ApplicationFailure.retryable("synthetic failure", "SYNTHETIC"));
-    const handle = await start("roomAgentActionWorkflow", { bridge: { roomId: "room:action", missionId: "mission:action" }, traceId: "trace:action" }, "space-room-action:synthetic");
+    const handle = await start("roomAgentActionWorkflow", { bridge: { roomId: "room:action", missionId: "mission:action" }, traceId: "trace:action" }, "space-room-action:action:synthetic");
     await expect(handle.result()).rejects.toMatchObject({
       name: "WorkflowFailedError", cause: { name: "ActivityFailure", cause: { type: "SYNTHETIC" } }
     });
     expect(activities.runRoomAgentBackgroundAction).toHaveBeenCalledTimes(5);
     expect(activities.failRoomAgentBackgroundAction).toHaveBeenCalledWith(expect.objectContaining({
-      roomId: "room:action", missionId: "mission:action", actionId: "synthetic", cancelled: false
+      roomId: "room:action", missionId: "mission:action", actionId: "action:synthetic", cancelled: false
     }));
     await recordWorkflowHistory(handle, "room-agent-action-failure");
   }, 30_000);
